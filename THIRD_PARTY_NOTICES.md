@@ -17,6 +17,7 @@
 | PortAudio | MIT | 音声の再生 |
 | CFFI | MIT | ライブラリの呼び出し |
 | Python | PSF-2.0 | 実行環境 |
+| GNU gettext の libintl 1.0 | LGPL 2.1 以降 | Python が使用 |
 
 ## FFmpeg
 
@@ -33,3 +34,8 @@ AAC の処理には macOS に内蔵の機能を使います。映像は再圧縮
 
 Qt は LGPL 3 のもとで、動的ライブラリのまま同梱しています。
 ソースコードは [download.qt.io](https://download.qt.io/official_releases/qt/) から入手できます。
+
+## GNU gettext
+
+libintl は LGPL 2.1 以降のもとで、動的ライブラリのまま同梱しています。
+ソースコードは [ftp.gnu.org](https://ftp.gnu.org/gnu/gettext/) から入手できます（版 1.0）。

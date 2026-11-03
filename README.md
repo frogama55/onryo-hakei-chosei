@@ -13,7 +13,7 @@
 
 ## 動作環境
 
-macOS、Apple シリコンの Mac（M1 以降）
+macOS 15.5 以降、Apple シリコンの Mac（M1 以降）
 
 ## インストール
 
@@ -75,4 +75,13 @@ pip install -r requirements.txt
 brew install ffmpeg                         # 開発時は PATH の FFmpeg を使う
 python main.py                              # 起動
 python -m unittest discover -s tests -t .   # テスト
+```
+
+配布版を作る手順:
+
+```bash
+python -m venv --system-site-packages .venv-release
+.venv-release/bin/python -m pip install pyinstaller==6.22.3
+./scripts/build_ffmpeg.sh    # FFmpeg を LGPL の範囲でビルド
+./scripts/build_release.sh   # .app と zip を作り、ライセンスの監査を行う
 ```
