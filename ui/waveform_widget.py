@@ -36,7 +36,7 @@ def snap_gain(gain: float) -> float:
 
 
 class WaveformWidget(QWidget):
-    envelope_committed = pyqtSignal()   # 1回の操作が確定したとき
+    envelope_committed = pyqtSignal(str)  # 1回の操作が確定したとき。履歴に出す内容を渡す
     seek_requested = pyqtSignal(float)  # time in seconds
     view_changed = pyqtSignal(float, float)  # 表示範囲（秒）
 
@@ -72,6 +72,7 @@ class WaveformWidget(QWidget):
         self._press_gain: float = 0.0
         self._before_press: list[tuple[float, float]] = []
         self._drag_moved: bool = False
+        self._point_added: bool = False  # この操作で点を作ったか（履歴の表示に使う）
 
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.SizeVerCursor)
@@ -449,6 +450,7 @@ class WaveformWidget(QWidget):
             return
 
         idx = self._find_point_at(pos)
+        self._point_added = idx < 0
         if idx < 0:
             idx = self._envelope.add_point(self._x_to_time(pos.x()), self._y_to_gain(pos.y()))
             self._applied = None
@@ -484,13 +486,20 @@ class WaveformWidget(QWidget):
                 self._envelope.set_points(self._before_press)
                 self.refresh_envelope()
             else:
-                self.envelope_committed.emit()
+                added = len(self._envelope.get_points()) > len(self._before_press)
+                self.envelope_committed.emit(
+                    self._describe('音量を変更' if added else '点を動かす', self._dragging_idx))
             self._end_press()
             self.update()
         elif self._dragging_idx >= 0:
+            label = self._describe('点を追加' if self._point_added else '点を動かす', self._dragging_idx)
             self._dragging_idx = -1
-            self.envelope_committed.emit()
+            self.envelope_committed.emit(label)
             self.update()
+
+    def _describe(self, action: str, idx: int) -> str:
+        t, gain = self._envelope.get_points()[idx]
+        return f'{action} {gain:+.1f} dB（{format_time(round(t))}）'
 
     def _drag_waveform(self, pos: QPointF) -> None:
         """ドラッグ編集: つまんだ所の波形がマウスに付いてくるようにゲインを変える。"""
@@ -556,7 +565,8 @@ class WaveformWidget(QWidget):
     def _try_remove_point(self, pos: QPointF) -> None:
         idx = self._find_point_at(pos)
         if idx >= 0:
+            t = self._envelope.get_points()[idx][0]
             self._envelope.remove_point(idx)
             self._hover_idx = -1
-            self.envelope_committed.emit()
+            self.envelope_committed.emit(f'点を削除（{format_time(round(t))}）')
             self.refresh_envelope()

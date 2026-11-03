@@ -430,6 +430,96 @@ class WindowTest(unittest.TestCase):
         QTimer.singleShot(50, answer('書き出さずに閉じる'))
         self.assertTrue(REAL_CONFIRM_CLOSE(self.win))
 
+    # ------------------------------------------------------------------
+    # 編集の履歴
+    # ------------------------------------------------------------------
+
+    def history_texts(self):
+        lst = self.win._history_list
+        return [lst.item(i).text().split('\n')[0] for i in range(lst.count())]
+
+    def raise_at(self, t, db):
+        start = self.on_wave(t)
+        self.drag(start, start - QPoint(0, self.db_px(db)))
+
+    def click_history(self, row):
+        lst = self.win._history_list
+        QTest.mouseClick(lst.viewport(), LEFT, pos=lst.visualItemRect(lst.item(row)).center())
+
+    def test_history_lists_edits_with_time(self):
+        self.raise_at(3.0, 6.0)
+        self.raise_at(7.0, -6.0)
+        texts = self.history_texts()
+        self.assertEqual(texts[0], 'ファイルを開く')
+        self.assertTrue(texts[1].startswith('音量を変更 +6.'), texts[1])
+        self.assertIn('（0:03）', texts[1])
+        self.assertTrue(texts[2].startswith('音量を変更 -6.'), texts[2])
+        second_line = self.win._history_list.item(1).text().split('\n')[1]
+        self.assertRegex(second_line, r'^\d{1,2}/\d{1,2} \d\d:\d\d:\d\d$')
+        self.assertEqual(self.win._history_list.currentRow(), 2)
+
+    def test_history_labels_for_each_operation(self):
+        self.raise_at(5.0, 6.0)
+        again = self.on_wave(5.0)
+        self.drag(again, again - QPoint(0, self.db_px(2.0)))
+        QTest.mouseClick(self.wave, RIGHT, pos=self.on_wave(5.0))
+        self.edit_mode()
+        self.add_point(2.0, 6.0)
+        self.win._reset_envelope()
+        labels = [t.split(' ')[0].split('（')[0] for t in self.history_texts()]
+        self.assertEqual(labels, ['ファイルを開く', '音量を変更', '点を動かす', '点を削除', '点を追加',
+                                  '調整をリセット'])
+
+    def test_click_history_item_rewinds_and_keeps_later_items(self):
+        self.raise_at(3.0, 6.0)
+        after_first = self.env()
+        self.raise_at(7.0, 6.0)
+        self.click_history(1)
+        self.assertEqual(self.env(), after_first)
+        self.assertEqual(self.win._history_list.count(), 3)
+        self.assertEqual(self.win._history_list.currentRow(), 1)
+        self.assertTrue(self.win._redo_btn.isEnabled())
+        self.click_history(0)
+        self.assertTrue(self.win._envelope.is_flat())
+        self.click_history(2)
+        self.assertAlmostEqual(self.win._envelope.gain_db_at(7.0), 6.0, delta=0.3)
+
+    def test_new_edit_after_rewind_clears_later_items(self):
+        self.raise_at(3.0, 6.0)
+        self.raise_at(7.0, 6.0)
+        self.click_history(1)
+        self.raise_at(5.0, -3.0)
+        self.assertEqual(len(self.history_texts()), 3)
+        self.assertTrue(self.history_texts()[2].startswith('音量を変更 -3.'))
+        self.assertFalse(self.win._redo_btn.isEnabled())
+
+    def test_back_and_forward_buttons(self):
+        self.assertFalse(self.win._undo_btn.isEnabled())
+        self.raise_at(5.0, 6.0)
+        changed = self.env()
+        QTest.mouseClick(self.win._undo_btn, LEFT)
+        self.assertTrue(self.win._envelope.is_flat())
+        self.assertFalse(self.win._undo_btn.isEnabled())
+        QTest.mouseClick(self.win._redo_btn, LEFT)
+        self.assertEqual(self.env(), changed)
+
+    def test_command_z_goes_back(self):
+        self.raise_at(5.0, 6.0)
+        QTest.keyClick(self.win, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)  # macOS では ⌘Z
+        self.assertTrue(self.win._envelope.is_flat())
+        self.assertEqual(self.win._history_list.currentRow(), 0)
+
+    def test_rewind_is_saved_for_reopen(self):
+        self.raise_at(5.0, 6.0)
+        self.click_history(0)
+        self.assertEqual(edit_store.load_points(self.src), None)
+
+    def test_history_starts_over_with_restore_label(self):
+        self.raise_at(5.0, 6.0)
+        self.win.load_path(self.src)
+        self.assertTrue(wait_until(lambda: self.win._worker is None))
+        self.assertEqual(self.history_texts(), ['前回の編集を復元'])
+
     def test_close_is_refused_during_work(self):
         self.win.load_path(self.src)
         self.assertFalse(self.win.close())

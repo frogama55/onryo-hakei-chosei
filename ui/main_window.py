@@ -5,10 +5,10 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QButtonGroup, QLabel, QDoubleSpinBox, QGroupBox,
     QFileDialog, QSplitter, QFrame, QMessageBox,
-    QStatusBar, QProgressBar, QScrollBar,
+    QStatusBar, QProgressBar, QScrollBar, QListWidget, QListWidgetItem,
 )
 from PyQt6.QtCore import Qt, QEvent, QTimer, pyqtSlot
-from PyQt6.QtGui import QAction, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QColor, QKeySequence, QShortcut
 
 from app_info import APP_NAME, COPYRIGHT_HOLDER, FFMPEG_NOTICE, SOURCE_URL, VERSION
 from audio.envelope import Envelope
@@ -16,6 +16,7 @@ from audio.loader import SUPPORTED_AUDIO, SUPPORTED_VIDEO
 from audio.player import Player, PlayerError
 from utils import edit_store
 from utils.exporter import AUDIO_OUTPUTS
+from utils.history import EditHistory
 from ui.waveform_widget import MODE_DRAG, MODE_LINE, WaveformWidget
 from ui.transport import TransportBar
 from ui.workers import ExportWorker, LoadedFile, LoadWorker
@@ -52,16 +53,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1000, 600)
+        self.resize(1100, 720)
 
         self._file: LoadedFile | None = None
         self._duration: float = 0.0
         self._envelope: Envelope | None = None
         self._player = Player()
         self._worker: LoadWorker | ExportWorker | None = None
-        self._undo_stack: list[list[tuple[float, float]]] = []
-        self._redo_stack: list[list[tuple[float, float]]] = []
-        self._saved_points: list[tuple[float, float]] = []
+        self._history = EditHistory(HISTORY_MAX)
         # 最後に書き出した調整。None は、このファイルをまだ書き出していないこと
         self._exported_points: list[tuple[float, float]] | None = None
 
@@ -293,17 +292,18 @@ class MainWindow(QMainWindow):
 
     def _build_side_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setFixedWidth(190)
-        panel.setStyleSheet('background:#222; border-left:1px solid #333;')
+        panel.setObjectName('sidePanel')
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        panel.setFixedWidth(210)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 12, 10, 12)
-        layout.setSpacing(14)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(8)
 
         # File info
         info_group = QGroupBox('ファイル情報')
         info_layout = QVBoxLayout(info_group)
         self._info_label = QLabel('—')
-        self._info_label.setMinimumHeight(84)
+        self._info_label.setMinimumHeight(80)  # 5行。履歴の欄に押しつぶされないように
         self._info_label.setStyleSheet('color:#888; font-size:11px; line-height:1.8;')
         info_layout.addWidget(self._info_label)
 
@@ -316,8 +316,40 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(info_group)
         layout.addWidget(hint_group)
-        layout.addStretch()
+        layout.addWidget(self._build_history_panel(), stretch=1)
         return panel
+
+    def _build_history_panel(self) -> QWidget:
+        group = QGroupBox('編集の履歴')
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(6, 8, 6, 6)
+        layout.setSpacing(6)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
+        self._undo_btn = QPushButton('← 戻る')
+        self._undo_btn.setToolTip('1つ前の状態へ戻ります（⌘Z）')
+        self._undo_btn.clicked.connect(self._undo)
+        self._redo_btn = QPushButton('進む →')
+        self._redo_btn.setToolTip('戻した操作をやり直します（⇧⌘Z）')
+        self._redo_btn.clicked.connect(self._redo)
+        for b in [self._undo_btn, self._redo_btn]:
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # スペースキーを再生に使うため
+            b.setEnabled(False)
+            buttons.addWidget(b)
+        layout.addLayout(buttons)
+
+        self._history_list = QListWidget()
+        self._history_list.setObjectName('historyList')
+        self._history_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._history_list.setMinimumHeight(90)
+        self._history_list.setWordWrap(True)
+        self._history_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._history_list.setToolTip('項目を押すと、その時点まで戻ります')
+        self._history_list.itemClicked.connect(
+            lambda item: self._go_to_history(self._history_list.row(item)))
+        layout.addWidget(self._history_list)
+        return group
 
     def _connect_signals(self):
         self._waveform.envelope_committed.connect(self._on_envelope_committed)
@@ -365,10 +397,9 @@ class MainWindow(QMainWindow):
         restored = edit_store.load_points(file.path)
         if restored:
             self._envelope.set_points(restored)
-        self._saved_points = self._envelope.get_points()
         self._exported_points = None
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        self._history.start('前回の編集を復元' if restored else 'ファイルを開く',
+                            self._envelope.get_points())
         self._update_history_actions()
 
         self._waveform.load_waveform(file.times, file.rms_db, file.peak_db,
@@ -494,45 +525,52 @@ class MainWindow(QMainWindow):
     # Edit history
     # ------------------------------------------------------------------
 
-    @pyqtSlot()
-    def _on_envelope_committed(self):
+    @pyqtSlot(str)
+    def _on_envelope_committed(self, label: str):
         if self._envelope is None:
             return
-        self._push_history()
+        if self._history.push(label, self._envelope.get_points()):
+            self._update_history_actions()
         edit_store.save_points(self._file.path, self._envelope.get_points())
 
-    def _push_history(self) -> None:
-        points = self._envelope.get_points()
-        if points == self._saved_points:
+    def _go_to_history(self, index: int) -> None:
+        points = self._history.go_to(index)
+        if points is None:
             return
-        self._undo_stack.append(self._saved_points)
-        del self._undo_stack[:-HISTORY_MAX]
-        self._redo_stack.clear()
-        self._saved_points = points
-        self._update_history_actions()
-
-    def _restore_points(self, points: list[tuple[float, float]]) -> None:
         self._envelope.set_points(points)
-        self._saved_points = points
         self._waveform.refresh_envelope()
         edit_store.save_points(self._file.path, points)
         self._update_history_actions()
 
     @pyqtSlot()
     def _undo(self):
-        if self._undo_stack:
-            self._redo_stack.append(self._saved_points)
-            self._restore_points(self._undo_stack.pop())
+        if self._history.can_undo():
+            self._go_to_history(self._history.index - 1)
 
     @pyqtSlot()
     def _redo(self):
-        if self._redo_stack:
-            self._undo_stack.append(self._saved_points)
-            self._restore_points(self._redo_stack.pop())
+        if self._history.can_redo():
+            self._go_to_history(self._history.index + 1)
 
     def _update_history_actions(self) -> None:
-        self._undo_act.setEnabled(bool(self._undo_stack))
-        self._redo_act.setEnabled(bool(self._redo_stack))
+        for act, btn, enabled in [(self._undo_act, self._undo_btn, self._history.can_undo()),
+                                  (self._redo_act, self._redo_btn, self._history.can_redo())]:
+            act.setEnabled(enabled)
+            btn.setEnabled(enabled)
+
+        # 今の位置より後ろ（進むで戻れる項目）は薄く表示する
+        lst = self._history_list
+        lst.clear()
+        for i, entry in enumerate(self._history.entries):
+            when = f'{entry.time.month}/{entry.time.day} {entry.time:%H:%M:%S}'
+            item = QListWidgetItem(f'{entry.label}\n{when}')
+            item.setToolTip(f'{entry.label}\n{entry.time:%Y-%m-%d %H:%M:%S}')
+            if i > self._history.index:
+                item.setForeground(QColor('#5a5a5a'))
+            lst.addItem(item)
+        if self._history.entries:
+            lst.setCurrentRow(self._history.index)
+            lst.scrollToItem(lst.currentItem())
 
     def _set_mode(self, mode: str) -> None:
         self._waveform.set_mode(mode)
@@ -544,7 +582,7 @@ class MainWindow(QMainWindow):
         if self._envelope:
             self._envelope.reset()
             self._waveform.refresh_envelope()
-            self._on_envelope_committed()
+            self._on_envelope_committed('調整をリセット')
 
     @pyqtSlot()
     def _on_threshold_changed(self):
@@ -714,6 +752,22 @@ class MainWindow(QMainWindow):
             #toolbar { background:#252525; border-bottom:1px solid #333; }
             #toolbar QLabel, #toolbar QFrame { background:transparent; }
             QLabel#groupLabel { color:#888; font-size:11px; }
+            #sidePanel { background:#222; border-left:1px solid #333; }
+            #sidePanel QWidget { background:#222; }
+            QListWidget#historyList {
+                background:#1a1a1a; color:#ccc; border:1px solid #333;
+                border-radius:3px; font-size:11px;
+            }
+            QListWidget#historyList::item { padding:3px 4px; border-bottom:1px solid #262626; }
+            QListWidget#historyList::item:hover { background:#333; }
+            QListWidget#historyList::item:selected { background:#1a5c3a; color:#a0ffc8; }
+            QListWidget#historyList QScrollBar:vertical { background:#1a1a1a; width:8px; }
+            QListWidget#historyList QScrollBar::handle:vertical {
+                background:#444; border-radius:4px; min-height:20px;
+            }
+            QListWidget#historyList QScrollBar::add-line, QListWidget#historyList QScrollBar::sub-line {
+                height:0;
+            }
             QGroupBox {
                 color:#888; border:1px solid #333; border-radius:4px;
                 margin-top:10px; padding-top:6px; font-size:11px;
