@@ -24,6 +24,7 @@ ensure_tools()
 app = QApplication.instance() or QApplication([])
 SR = 48000
 LEFT = Qt.MouseButton.LeftButton
+REAL_CONFIRM_CLOSE = MainWindow._confirm_close
 RIGHT = Qt.MouseButton.RightButton
 
 
@@ -45,6 +46,10 @@ class WindowTest(unittest.TestCase):
         patcher = mock.patch.object(edit_store, 'STORE_DIR', self.dir / 'store')
         patcher.start()
         self.addCleanup(patcher.stop)
+        # 後片付けで閉じるときに確認のダイアログで止まらないようにする
+        confirm = mock.patch.object(MainWindow, '_confirm_close', return_value=True)
+        confirm.start()
+        self.addCleanup(confirm.stop)
 
         self.src = str(self.dir / 'test.wav')
         t = np.arange(SR * 10) / SR
@@ -370,6 +375,60 @@ class WindowTest(unittest.TestCase):
                 QTest.keyClick(widget, Qt.Key.Key_Space)
             play.assert_called_once()
         self.assertEqual(self.win._upper_spin.value(), -6.0)
+
+    def close_asks(self, answer):
+        with mock.patch.object(MainWindow, '_confirm_close', return_value=answer) as ask:
+            closed = self.win.close()
+        return ask.call_count, closed
+
+    def test_close_without_changes_does_not_ask(self):
+        self.assertEqual(self.close_asks(False), (0, True))
+
+    def test_close_with_unexported_changes_asks(self):
+        start = self.on_wave(5.0)
+        self.drag(start, start - QPoint(0, self.db_px(6.0)))
+        self.assertEqual(self.close_asks(False), (1, False))
+        self.assertTrue(self.win.isVisible())
+        self.assertEqual(self.close_asks(True), (1, True))
+
+    def test_close_after_export_does_not_ask(self):
+        self.win._envelope.set_points([(0.0, -6.0), (10.0, -6.0)])
+        self.export_to('done.wav')
+        self.assertEqual(self.close_asks(False), (0, True))
+
+    def test_change_after_export_asks_again(self):
+        self.win._envelope.set_points([(0.0, -6.0), (10.0, -6.0)])
+        self.export_to('done.wav')
+        self.win._envelope.set_points([(0.0, -3.0), (10.0, -6.0)])
+        self.assertEqual(self.close_asks(False), (1, False))
+
+    def test_undo_back_to_original_does_not_ask(self):
+        start = self.on_wave(5.0)
+        self.drag(start, start - QPoint(0, self.db_px(6.0)))
+        self.win._undo()
+        self.assertEqual(self.close_asks(False), (0, True))
+
+    def test_restored_edit_counts_as_unexported(self):
+        start = self.on_wave(5.0)
+        self.drag(start, start - QPoint(0, self.db_px(6.0)))
+        other = MainWindow()
+        other.show()
+        self.addCleanup(other.close)
+        other.load_path(self.src)
+        self.assertTrue(wait_until(lambda: other._worker is None))
+        self.assertTrue(other.has_unexported_changes())
+
+    def test_close_dialog_buttons(self):
+        def answer(button_text):
+            def run():
+                box = QApplication.activeModalWidget()
+                next(b for b in box.buttons() if b.text() == button_text).click()
+            return run
+        self.win._envelope.set_points([(0.0, -6.0), (10.0, -6.0)])
+        QTimer.singleShot(50, answer('キャンセル'))
+        self.assertFalse(REAL_CONFIRM_CLOSE(self.win))
+        QTimer.singleShot(50, answer('書き出さずに閉じる'))
+        self.assertTrue(REAL_CONFIRM_CLOSE(self.win))
 
     def test_close_is_refused_during_work(self):
         self.win.load_path(self.src)

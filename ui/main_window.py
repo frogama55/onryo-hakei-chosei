@@ -62,6 +62,8 @@ class MainWindow(QMainWindow):
         self._undo_stack: list[list[tuple[float, float]]] = []
         self._redo_stack: list[list[tuple[float, float]]] = []
         self._saved_points: list[tuple[float, float]] = []
+        # 最後に書き出した調整。None は、このファイルをまだ書き出していないこと
+        self._exported_points: list[tuple[float, float]] | None = None
 
         self.setAcceptDrops(True)
 
@@ -190,8 +192,9 @@ class MainWindow(QMainWindow):
 
     def _build_toolbar(self) -> QWidget:
         bar = QWidget()
+        bar.setObjectName('toolbar')
+        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         bar.setFixedHeight(44)
-        bar.setStyleSheet('background:#252525; border-bottom:1px solid #333;')
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(10, 4, 10, 4)
         layout.setSpacing(8)
@@ -207,25 +210,36 @@ class MainWindow(QMainWindow):
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setStyleSheet('color:#444;')
 
-        self._drag_btn = QPushButton('✋ ドラッグ編集')
-        self._drag_btn.setToolTip('波形をつまんで上下に動かします')
-        self._line_btn = QPushButton('✎ ライン編集')
-        self._line_btn.setToolTip('音量の線に点を打って動かします')
+        self._drag_btn = QPushButton('ドラッグ編集')
+        self._drag_btn.setToolTip('波形をつまんで上下に動かし、その部分の音量を変えます')
+        self._line_btn = QPushButton('ライン編集')
+        self._line_btn.setToolTip('音量の線に点を打ち、点を動かして音量を変えます')
         self._mode_group = QButtonGroup(self)
-        for btn, mode in [(self._drag_btn, MODE_DRAG), (self._line_btn, MODE_LINE)]:
+        # 2つで1組の切り替えに見えるよう、間を詰めて並べる
+        modes = QHBoxLayout()
+        modes.setSpacing(0)
+        for btn, mode, name in [(self._drag_btn, MODE_DRAG, 'segLeft'),
+                                (self._line_btn, MODE_LINE, 'segRight')]:
+            btn.setObjectName(name)
             btn.setCheckable(True)
+            modes.addWidget(btn)
             btn.clicked.connect(lambda _=False, m=mode: self._set_mode(m))
             self._mode_group.addButton(btn)
         self._drag_btn.setChecked(True)
 
-        reset_btn = QPushButton('↩ リセット')
+        reset_btn = QPushButton('調整をリセット')
+        reset_btn.setToolTip('音量の調整をすべて元に戻します（⌘Z で取り消せます）')
         reset_btn.clicked.connect(self._reset_envelope)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.VLine)
         sep2.setStyleSheet('color:#444;')
 
-        threshold_label_up = QLabel('上限:')
+        threshold_tip = '波形の背景の色分けに使う目安です。音は変わりません'
+        threshold_label = QLabel('目安')
+        threshold_label.setObjectName('groupLabel')
+        threshold_label.setToolTip(threshold_tip)
+        threshold_label_up = QLabel('上限')
         self._upper_spin = QDoubleSpinBox()
         self._upper_spin.setRange(-64.0, 0.0)
         self._upper_spin.setValue(-6.0)
@@ -233,7 +247,7 @@ class MainWindow(QMainWindow):
         self._upper_spin.setDecimals(1)
         self._upper_spin.setFixedWidth(90)
 
-        threshold_label_lo = QLabel('下限:')
+        threshold_label_lo = QLabel('下限')
         self._lower_spin = QDoubleSpinBox()
         self._lower_spin.setRange(-64.0, 0.0)
         self._lower_spin.setValue(-40.0)
@@ -241,6 +255,7 @@ class MainWindow(QMainWindow):
         self._lower_spin.setDecimals(1)
         self._lower_spin.setFixedWidth(90)
         for spin in [self._upper_spin, self._lower_spin]:
+            spin.setToolTip(threshold_tip)
             spin.installEventFilter(self)  # 入力欄にカーソルがあってもスペースで再生する
 
         zoom_btns = []
@@ -258,11 +273,19 @@ class MainWindow(QMainWindow):
         for b in [open_btn, export_btn, self._drag_btn, self._line_btn, reset_btn, *zoom_btns]:
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # スペースキーを再生に使うため
 
-        for w in [open_btn, export_btn, sep, self._drag_btn, self._line_btn, reset_btn, sep2,
-                  threshold_label_up, self._upper_spin, threshold_label_lo, self._lower_spin]:
+        mode_label = QLabel('編集')
+        mode_label.setObjectName('groupLabel')
+        view_label = QLabel('表示')
+        view_label.setObjectName('groupLabel')
+
+        for w in [open_btn, export_btn, sep, mode_label]:
+            layout.addWidget(w)
+        layout.addLayout(modes)
+        for w in [reset_btn, sep2, threshold_label, threshold_label_up, self._upper_spin,
+                  threshold_label_lo, self._lower_spin]:
             layout.addWidget(w)
         layout.addStretch()
-        layout.addWidget(QLabel('表示:'))
+        layout.addWidget(view_label)
         for b in zoom_btns:
             layout.addWidget(b)
         self._toolbar = bar
@@ -343,6 +366,7 @@ class MainWindow(QMainWindow):
         if restored:
             self._envelope.set_points(restored)
         self._saved_points = self._envelope.get_points()
+        self._exported_points = None
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._update_history_actions()
@@ -411,10 +435,35 @@ class MainWindow(QMainWindow):
         self._progress.setRange(0, 1000)
         self._worker = ExportWorker(self._file, self._envelope.copy(), out_path, self)
         self._worker.progress.connect(lambda v: self._progress.setValue(int(v * 1000)))
-        self._worker.succeeded.connect(lambda path: self._status.showMessage(f'書き出し完了: {path}'))
+        self._worker.succeeded.connect(lambda path, points=self._envelope.get_points():
+                                       self._on_exported(path, points))
         self._worker.failed.connect(self._on_export_failed)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
+
+    def _on_exported(self, path: str, points: list[tuple[float, float]]) -> None:
+        self._exported_points = points
+        self._status.showMessage(f'書き出し完了: {path}')
+
+    def has_unexported_changes(self) -> bool:
+        if self._envelope is None:
+            return False
+        if self._exported_points is None:
+            return not self._envelope.is_flat()
+        return self._envelope.get_points() != self._exported_points
+
+    def _confirm_close(self) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle('確認')
+        box.setText('書き出していない調整があります。閉じますか？')
+        box.setInformativeText('調整の内容は自動で保存され、次に同じファイルを開くと元に戻ります。'
+                               'ただし、音声や動画のファイルは書き出すまで作られません。')
+        close_btn = box.addButton('書き出さずに閉じる', QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton('キャンセル', QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        return box.clickedButton() is close_btn
 
     def _clipped_seconds(self) -> float:
         file = self._file
@@ -623,6 +672,9 @@ class MainWindow(QMainWindow):
             self._status.showMessage('処理が終わるまでお待ちください')
             event.ignore()
             return
+        if self.has_unexported_changes() and not self._confirm_close():
+            event.ignore()
+            return
         self._player.stop()
         event.accept()
 
@@ -641,16 +693,27 @@ class MainWindow(QMainWindow):
                 background:#333; color:#ccc; border:1px solid #444;
                 border-radius:4px; padding:4px 12px; font-size:12px;
             }
-            QPushButton:hover { background:#3a3a3a; }
-            QPushButton:checked { background:#1a5c3a; border-color:#1a8050; color:#80ffb0; }
+            QPushButton:hover { background:#4a4a4a; border-color:#9a9a9a; color:white; }
+            QPushButton:pressed { background:#262626; }
+            QPushButton:disabled { color:#666; border-color:#3a3a3a; }
+            QPushButton:checked { background:#1a5c3a; border-color:#2a9a60; color:#a0ffc8; }
+            QPushButton:checked:hover { background:#227048; border-color:#80e0a8; }
+            QPushButton#segLeft { border-top-right-radius:0; border-bottom-right-radius:0; }
+            QPushButton#segRight {
+                border-top-left-radius:0; border-bottom-left-radius:0; border-left:none;
+            }
             QPushButton#primaryBtn {
                 background:#1a6fbb; border-color:#1a6fbb; color:white;
             }
-            QPushButton#primaryBtn:hover { background:#2080cc; }
+            QPushButton#primaryBtn:hover { background:#3a90dd; border-color:#9ccaf5; }
             QDoubleSpinBox {
                 background:#1a1a1a; color:#ccc; border:1px solid #444;
                 border-radius:3px; padding:2px 4px;
             }
+            QDoubleSpinBox:hover { border-color:#9a9a9a; }
+            #toolbar { background:#252525; border-bottom:1px solid #333; }
+            #toolbar QLabel, #toolbar QFrame { background:transparent; }
+            QLabel#groupLabel { color:#888; font-size:11px; }
             QGroupBox {
                 color:#888; border:1px solid #333; border-radius:4px;
                 margin-top:10px; padding-top:6px; font-size:11px;
