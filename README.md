@@ -84,4 +84,5 @@ python -m venv --system-site-packages .venv-release
 .venv-release/bin/python -m pip install pyinstaller==6.22.3
 ./scripts/build_ffmpeg.sh    # FFmpeg を LGPL の範囲でビルド
 ./scripts/build_release.sh   # .app と zip を作り、ライセンスの監査を行う
+.venv-release/bin/python scripts/test_release.py dist/*.zip   # 各形式の動作を確認
 ```
