@@ -16,6 +16,7 @@ AUDIO = [
     ('alac.m4a', ['-c:a', 'alac'], 'alac_o.m4a'),
     ('a.mp3', ['-c:a', 'libmp3lame'], 'o.mp3'),
     ('a.opus', ['-c:a', 'libopus'], 'o.wav'),
+    ('a.ogg', ['-c:a', 'vorbis', '-strict', '-2'], 'ogg_o.flac'),
     ('a.flac', [], 'o.flac'),
 ]
 VIDEO = [
