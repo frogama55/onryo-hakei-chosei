@@ -236,6 +236,11 @@ class WaveformWidget(QWidget):
         self._draw_background(p, W, H)
         self._draw_grid(p, W, H)
         self._draw_threshold_zones(p, W, H)
+        if self._rms_db is None:
+            p.setPen(QColor('#777'))
+            p.setFont(QFont('Helvetica', 13))
+            p.drawText(QRectF(0, 0, W, H), Qt.AlignmentFlag.AlignCenter,
+                       'ファイルを開くか、ここへドラッグしてください\n\n元のファイルは変更しません')
         if self._rms_db is not None and self._view_end > self._view_start:
             if self._mode == MODE_DRAG:
                 self._draw_original_outline(p, W)

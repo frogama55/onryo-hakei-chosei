@@ -12,7 +12,7 @@ import soundfile as sf
 from PyQt6.QtCore import QEventLoop, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
 from PyQt6.QtGui import QDropEvent, QNativeGestureEvent, QPointingDevice, QWheelEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox, QPushButton
 
 from app_info import APP_NAME
 from audio.loader import ensure_tools, load_file
@@ -25,6 +25,7 @@ app = QApplication.instance() or QApplication([])
 SR = 48000
 LEFT = Qt.MouseButton.LeftButton
 REAL_CONFIRM_CLOSE = MainWindow._confirm_close
+REAL_SHOW_EXPORTED = MainWindow._show_exported
 RIGHT = Qt.MouseButton.RightButton
 
 
@@ -50,6 +51,9 @@ class WindowTest(unittest.TestCase):
         confirm = mock.patch.object(MainWindow, '_confirm_close', return_value=True)
         confirm.start()
         self.addCleanup(confirm.stop)
+        exported = mock.patch.object(MainWindow, '_show_exported')
+        self.show_exported = exported.start()
+        self.addCleanup(exported.stop)
 
         self.src = str(self.dir / 'test.wav')
         t = np.arange(SR * 10) / SR
@@ -519,6 +523,85 @@ class WindowTest(unittest.TestCase):
         self.win.load_path(self.src)
         self.assertTrue(wait_until(lambda: self.win._worker is None))
         self.assertEqual(self.history_texts(), ['前回の編集を復元'])
+
+    # ------------------------------------------------------------------
+    # 保存の状態
+    # ------------------------------------------------------------------
+
+    def status(self):
+        return {name: value for name, value, _ in self.win.save_status()}
+
+    def test_save_status_after_open(self):
+        self.assertEqual(self.status(), {'元のファイル': '変更しません', '編集内容': '調整なし', '書き出し': '—'})
+        self.assertIn('変更しません', self.win._save_label.text())
+        self.assertIn('元のファイルは変更しません', self.win._status.currentMessage())
+
+    def test_save_status_before_open(self):
+        other = MainWindow()
+        self.addCleanup(other.close)
+        self.assertEqual({v for _, v, _ in other.save_status()}, {'—'})
+
+    def test_save_status_follows_edit_and_export(self):
+        self.raise_at(5.0, 6.0)
+        self.assertTrue(self.status()['編集内容'].startswith('自動保存済み '))
+        self.assertEqual(self.status()['書き出し'], 'まだです')
+        out = self.export_to('done.wav')
+        self.assertEqual(self.status()['書き出し'], '済み')
+        self.show_exported.assert_called_once_with(out)
+        self.assertIn(out, self.win._save_label.toolTip())
+        self.raise_at(2.0, -6.0)
+        self.assertEqual(self.status()['書き出し'], 'その後に変更あり')
+        self.win._undo()
+        self.assertEqual(self.status()['書き出し'], '済み')
+
+    def test_save_status_when_restored(self):
+        self.raise_at(5.0, 6.0)
+        self.win.load_path(self.src)
+        self.assertTrue(wait_until(lambda: self.win._worker is None))
+        self.assertEqual(self.status()['編集内容'], '保存済み（前回の内容）')
+        self.assertEqual(self.status()['書き出し'], 'まだです')
+        self.assertIn('前回の編集内容を復元', self.win._status.currentMessage())
+
+    def test_save_status_shows_autosave_failure(self):
+        with mock.patch.object(edit_store, 'save_points', return_value=False):
+            self.raise_at(5.0, 6.0)
+        self.assertEqual(self.status()['編集内容'], '保存できません')
+        self.raise_at(2.0, 3.0)
+        self.assertTrue(self.status()['編集内容'].startswith('自動保存済み '))
+
+    def test_autosave_failure_is_reported_by_store(self):
+        with mock.patch.object(edit_store, 'STORE_DIR', Path('/dev/null/none')):
+            self.assertFalse(edit_store.save_points(self.src, [(0.0, 3.0), (10.0, 3.0)]))
+        self.assertTrue(edit_store.save_points(self.src, [(0.0, 3.0), (10.0, 3.0)]))
+
+    def test_command_s_explains_autosave(self):
+        self.raise_at(5.0, 6.0)
+        QTest.keyClick(self.win, Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier)  # macOS では ⌘S
+        self.assertIn('自動で保存されています', self.win._status.currentMessage())
+        self.assertIn('新しいファイルに書き出す', self.win._status.currentMessage())
+
+    def test_names_say_a_new_file_is_made(self):
+        texts = [b.text() for b in self.win._toolbar.findChildren(QPushButton)]
+        self.assertIn('新しいファイルに書き出す', texts)
+        title, body = self.win.save_help_text()
+        self.assertIn('元のファイルを書き換えません', title)
+        for word in ['自動で保存', 'アプリ専用の場所', '新しいファイル', '音声のファイルではありません']:
+            self.assertIn(word, body)
+
+    def test_export_dialog_can_reveal_in_finder(self):
+        def click(text):
+            def run():
+                box = QApplication.activeModalWidget()
+                self.assertIn('元のファイルはそのまま', box.informativeText())
+                next(b for b in box.buttons() if b.text() == text).click()
+            return run
+        with mock.patch('ui.main_window.subprocess.run') as run:
+            QTimer.singleShot(50, click('OK'))
+            REAL_SHOW_EXPORTED(self.win, '/tmp/x.wav')
+            run.assert_not_called()
+            QTimer.singleShot(50, click('Finder で表示'))
+            REAL_SHOW_EXPORTED(self.win, '/tmp/x.wav')
+            run.assert_called_once_with(['open', '-R', '/tmp/x.wav'], check=False)
 
     def test_close_is_refused_during_work(self):
         self.win.load_path(self.src)

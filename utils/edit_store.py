@@ -30,16 +30,19 @@ def load_points(source_path: str) -> list[tuple[float, float]] | None:
         return None
 
 
-def save_points(source_path: str, points: list[tuple[float, float]]) -> None:
+def save_points(source_path: str, points: list[tuple[float, float]]) -> bool:
+    """保存できたかを返す。調整がなければ保存を消す。"""
     path = _store_path(source_path)
     try:
         if all(g == 0.0 for _, g in points):
             path.unlink(missing_ok=True)
-            return
+            return True
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix('.tmp')
         tmp.write_text(json.dumps({'source': _fingerprint(source_path), 'points': points}), 'utf-8')
         os.replace(tmp, path)
+        return True
     except OSError as e:
         # 自動保存の失敗で編集を止めない
         print(f'edit_store: {e}', flush=True)
+        return False

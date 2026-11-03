@@ -1,3 +1,6 @@
+import html
+import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +66,9 @@ class MainWindow(QMainWindow):
         self._history = EditHistory(HISTORY_MAX)
         # 最後に書き出した調整。None は、このファイルをまだ書き出していないこと
         self._exported_points: list[tuple[float, float]] | None = None
+        self._exported_path: str | None = None
+        self._autosaved_at: datetime | None = None
+        self._autosave_failed = False
 
         self.setAcceptDrops(True)
 
@@ -141,7 +147,12 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        export_act = QAction('書き出し...', self)
+        save_act = QAction('編集内容を保存', self)
+        save_act.setShortcut(QKeySequence.StandardKey.Save)
+        save_act.triggered.connect(self._save_now)
+        file_menu.addAction(save_act)
+
+        export_act = QAction('新しいファイルに書き出す...', self)
         export_act.setShortcut(QKeySequence('Ctrl+E'))
         export_act.triggered.connect(self._export_file)
         file_menu.addAction(export_act)
@@ -181,6 +192,9 @@ class MainWindow(QMainWindow):
             view_menu.addAction(act)
 
         help_menu = menu.addMenu('ヘルプ')
+        how_act = QAction('保存のしくみ', self)
+        how_act.triggered.connect(self._show_save_help)
+        help_menu.addAction(how_act)
         about_act = QAction(f'{APP_NAME}について', self)
         about_act.setMenuRole(QAction.MenuRole.AboutRole)
         about_act.triggered.connect(self._show_about)
@@ -201,7 +215,8 @@ class MainWindow(QMainWindow):
         open_btn = QPushButton('ファイルを開く')
         open_btn.clicked.connect(self._open_file)
 
-        export_btn = QPushButton('書き出し')
+        export_btn = QPushButton('新しいファイルに書き出す')
+        export_btn.setToolTip('調整した音声を、元とは別のファイルとして作ります（⌘E）。元のファイルは変更しません')
         export_btn.setObjectName('primaryBtn')
         export_btn.clicked.connect(self._export_file)
 
@@ -299,13 +314,26 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(10, 8, 10, 10)
         layout.setSpacing(8)
 
-        # File info
-        info_group = QGroupBox('ファイル情報')
+        # ファイルと保存の状態
+        info_group = QGroupBox('ファイルと保存')
         info_layout = QVBoxLayout(info_group)
+        info_layout.setSpacing(6)
         self._info_label = QLabel('—')
-        self._info_label.setMinimumHeight(80)  # 5行。履歴の欄に押しつぶされないように
-        self._info_label.setStyleSheet('color:#888; font-size:11px; line-height:1.8;')
+        self._info_label.setStyleSheet('color:#888; font-size:11px;')
+        self._info_label.setMinimumHeight(48)  # 3行
+        self._save_label = QLabel()
+        self._save_label.setObjectName('saveStatus')
+        self._save_label.setStyleSheet('font-size:11px;')
+        self._save_label.setMinimumHeight(54)  # 3行。履歴の欄に押しつぶされないように
+        how_btn = QPushButton('保存のしくみ')
+        how_btn.setObjectName('linkBtn')
+        how_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        how_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        how_btn.clicked.connect(self._show_save_help)
         info_layout.addWidget(self._info_label)
+        info_layout.addWidget(self._save_label)
+        info_layout.addWidget(how_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        self._update_save_status()
 
         # Hint
         hint_group = QGroupBox('操作方法')
@@ -410,17 +438,25 @@ class MainWindow(QMainWindow):
         self._player.load(file.audio, file.sr, self._envelope)
 
         p = Path(file.path)
-        peak = float(file.peak_db.max())
+        channels = {1: 'モノラル', 2: 'ステレオ'}.get(file.audio.shape[1], f'{file.audio.shape[1]}ch')
+        minutes, seconds = divmod(int(round(self._duration)), 60)
+        # 横の欄の幅は固定なので、長い名前は途中を省く（全体はツールチップで見られる）
+        name = self._info_label.fontMetrics().elidedText(p.name, Qt.TextElideMode.ElideMiddle, 160)
         self._info_label.setText(
-            f'形式: {p.suffix.upper()[1:]}\n'
-            f'チャンネル: {file.audio.shape[1]}\n'
-            f'サンプルレート: {file.sr} Hz\n'
-            f'長さ: {self._duration:.1f} 秒\n'
-            f'ピーク: {peak:.1f} dB'
+            f'<span style="color:#ddd">{html.escape(name)}</span><br>'
+            f'{p.suffix.upper()[1:]}・{channels}・{file.sr / 1000:g} kHz<br>'
+            f'{minutes}分{seconds:02d}秒・ピーク {float(file.peak_db.max()):.1f} dB'
         )
+        self._info_label.setToolTip(file.path)
+        self._exported_path = None
+        self._autosaved_at = None
+        self._autosave_failed = False
+        self._update_save_status()
         self.setWindowTitle(f'{APP_NAME} — {p.name}')
-        note = '（前回の編集を復元しました）' if restored else ''
-        self._status.showMessage(f'{p.name} を読み込みました{note}')
+        if restored:
+            self._status.showMessage(f'{p.name} を開き、前回の編集内容を復元しました。元のファイルは変更しません')
+        else:
+            self._status.showMessage(f'{p.name} を開きました。元のファイルは変更しません')
         self._pos_timer.start()
 
     @pyqtSlot(str)
@@ -432,7 +468,7 @@ class MainWindow(QMainWindow):
     def _export_file(self):
         if self._file is None or self._envelope is None or self._worker is not None:
             if self._file is None:
-                QMessageBox.information(self, '書き出し', 'まずファイルを読み込んでください。')
+                QMessageBox.information(self, '書き出し', 'まずファイルを開いてください。')
             return
 
         p = Path(self._file.path)
@@ -445,7 +481,7 @@ class MainWindow(QMainWindow):
             file_filter = 'Audio Files (*.wav *.flac *.m4a *.mp3);;All Files (*)'
 
         out_path, _ = QFileDialog.getSaveFileName(
-            self, '書き出し先を選択', str(p.parent / default_name), file_filter
+            self, '新しいファイルとして書き出す', str(p.parent / default_name), file_filter
         )
         if not out_path:
             return
@@ -474,7 +510,99 @@ class MainWindow(QMainWindow):
 
     def _on_exported(self, path: str, points: list[tuple[float, float]]) -> None:
         self._exported_points = points
+        self._exported_path = path
+        self._update_save_status()
         self._status.showMessage(f'書き出し完了: {path}')
+        self._show_exported(path)
+
+    def _show_exported(self, path: str) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle('書き出し完了')
+        box.setText(f'新しいファイルを作りました。\n{Path(path).name}')
+        box.setInformativeText(f'場所: {Path(path).parent}\n\n元のファイルはそのまま残っています。')
+        reveal_btn = box.addButton('Finder で表示', QMessageBox.ButtonRole.ActionRole)
+        box.addButton('OK', QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
+        if box.clickedButton() is reveal_btn:
+            subprocess.run(['open', '-R', path], check=False)
+
+    # ------------------------------------------------------------------
+    # 保存の状態
+    # ------------------------------------------------------------------
+
+    def _save_edits(self) -> None:
+        """編集内容をアプリ専用の場所へ自動で保存する。元のファイルには書かない。"""
+        self._autosave_failed = not edit_store.save_points(self._file.path, self._envelope.get_points())
+        if not self._autosave_failed:
+            self._autosaved_at = datetime.now()
+        self._update_save_status()
+
+    @pyqtSlot()
+    def _save_now(self):
+        if self._envelope is None:
+            return
+        self._save_edits()
+        if self._autosave_failed:
+            self._status.showMessage('編集内容を保存できませんでした')
+        else:
+            self._status.showMessage('編集内容は自動で保存されています。'
+                                     '音声のファイルを作るには「新しいファイルに書き出す」を使います')
+
+    def save_status(self) -> list[tuple[str, str, str]]:
+        """（項目、状態、色の種類）の一覧。色は ok / warn / error / muted。"""
+        if self._envelope is None:
+            return [('元のファイル', '—', 'muted'), ('編集内容', '—', 'muted'), ('書き出し', '—', 'muted')]
+        if self._autosave_failed:
+            edits = ('保存できません', 'error')
+        elif self._envelope.is_flat():
+            edits = ('調整なし', 'muted')
+        elif self._autosaved_at is not None:
+            edits = (f'自動保存済み {self._autosaved_at:%H:%M}', 'ok')
+        else:
+            edits = ('保存済み（前回の内容）', 'ok')
+        if not self.has_unexported_changes():
+            export = ('済み', 'ok') if self._exported_path else ('—', 'muted')
+        elif self._exported_path:
+            export = ('その後に変更あり', 'warn')
+        else:
+            export = ('まだです', 'warn')
+        return [('元のファイル', '変更しません', 'ok'), ('編集内容', *edits), ('書き出し', *export)]
+
+    def _update_save_status(self) -> None:
+        colors = {'ok': '#8fd19e', 'warn': '#f0b450', 'error': '#ff6b6b', 'muted': '#777'}
+        rows = ''.join(
+            f'<tr><td style="color:#999; padding-right:8px">{name}</td>'
+            f'<td style="color:{colors[kind]}">{html.escape(value)}</td></tr>'
+            for name, value, kind in self.save_status())
+        self._save_label.setText(f'<table cellspacing="0" cellpadding="1">{rows}</table>')
+        tips = ['元のファイル: 読み込むだけで、書き換えません',
+                '編集内容: このアプリ専用の場所に自動で保存します。次に同じファイルを開くと続きから編集できます']
+        if self._exported_path:
+            tips.append(f'書き出したファイル: {self._exported_path}')
+        self._save_label.setToolTip('\n'.join(tips))
+
+    def save_help_text(self) -> tuple[str, str]:
+        return ('このアプリは、元のファイルを書き換えません。', (
+            '<b>1. 元のファイル</b><br>'
+            '読み込むだけです。変更も削除もしません。<br><br>'
+            '<b>2. 編集内容（自動で保存）</b><br>'
+            '音量の調整は、操作するたびにこの Mac の中のアプリ専用の場所へ自動で保存されます。'
+            '同じファイルをもう一度開くと、続きから編集できます。<br>'
+            'これは調整の記録で、音声のファイルではありません。ほかのアプリでは使えません。<br><br>'
+            '<b>3. 新しいファイルに書き出す（完成品）</b><br>'
+            '調整した音声を、元とは別の新しいファイルとして作ります。'
+            'ほかのアプリで使ったり、人に渡したりするのはこのファイルです。'
+        ))
+
+    @pyqtSlot()
+    def _show_save_help(self):
+        title, body = self.save_help_text()
+        box = QMessageBox(self)
+        box.setWindowTitle('保存のしくみ')
+        box.setText(title)
+        box.setInformativeText(body)
+        box.exec()
 
     def has_unexported_changes(self) -> bool:
         if self._envelope is None:
@@ -488,8 +616,8 @@ class MainWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle('確認')
         box.setText('書き出していない調整があります。閉じますか？')
-        box.setInformativeText('調整の内容は自動で保存され、次に同じファイルを開くと元に戻ります。'
-                               'ただし、音声や動画のファイルは書き出すまで作られません。')
+        box.setInformativeText('編集内容は自動で保存されているので、次に同じファイルを開くと続きから編集できます。'
+                               'ただし、調整した音声のファイルは「新しいファイルに書き出す」まで作られません。')
         close_btn = box.addButton('書き出さずに閉じる', QMessageBox.ButtonRole.DestructiveRole)
         cancel_btn = box.addButton('キャンセル', QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(cancel_btn)
@@ -531,7 +659,7 @@ class MainWindow(QMainWindow):
             return
         if self._history.push(label, self._envelope.get_points()):
             self._update_history_actions()
-        edit_store.save_points(self._file.path, self._envelope.get_points())
+        self._save_edits()
 
     def _go_to_history(self, index: int) -> None:
         points = self._history.go_to(index)
@@ -539,7 +667,7 @@ class MainWindow(QMainWindow):
             return
         self._envelope.set_points(points)
         self._waveform.refresh_envelope()
-        edit_store.save_points(self._file.path, points)
+        self._save_edits()
         self._update_history_actions()
 
     @pyqtSlot()
@@ -754,6 +882,10 @@ class MainWindow(QMainWindow):
             QLabel#groupLabel { color:#888; font-size:11px; }
             #sidePanel { background:#222; border-left:1px solid #333; }
             #sidePanel QWidget { background:#222; }
+            QPushButton#linkBtn {
+                background:transparent; border:none; color:#6aa8e8; padding:0; font-size:11px;
+            }
+            QPushButton#linkBtn:hover { color:#9ccaf5; text-decoration:underline; }
             QListWidget#historyList {
                 background:#1a1a1a; color:#ccc; border:1px solid #333;
                 border-radius:3px; font-size:11px;
