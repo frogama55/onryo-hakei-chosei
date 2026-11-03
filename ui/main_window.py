@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QPushButton, QLabel, QDoubleSpinBox, QGroupBox,
+    QPushButton, QButtonGroup, QLabel, QDoubleSpinBox, QGroupBox,
     QFileDialog, QSplitter, QFrame, QMessageBox,
     QStatusBar, QProgressBar, QScrollBar,
 )
@@ -16,12 +16,36 @@ from audio.loader import SUPPORTED_AUDIO, SUPPORTED_VIDEO
 from audio.player import Player, PlayerError
 from utils import edit_store
 from utils.exporter import AUDIO_OUTPUTS
-from ui.waveform_widget import WaveformWidget
+from ui.waveform_widget import MODE_DRAG, MODE_LINE, WaveformWidget
 from ui.transport import TransportBar
 from ui.workers import ExportWorker, LoadedFile, LoadWorker
 
 CLIP_WARN_SEC = 0.05
 HISTORY_MAX = 100
+
+_COMMON_HINTS = (
+    '• 上端の赤 → 音割れの位置\n'
+    '• ⌘+スクロール、ピンチ\n  → 拡大縮小\n'
+    '• スペース → 再生/一時停止'
+)
+HINTS = {
+    MODE_DRAG: (
+        '• 波形を上下にドラッグ\n  → その部分の音量を変更\n'
+        '• 点をドラッグ → 再調整\n'
+        '• クリック → 再生位置へ\n'
+        '• 右クリック → 点を削除\n'
+        '• 点線 → 調整前の波形\n'
+        + _COMMON_HINTS
+    ),
+    MODE_LINE: (
+        '• クリック → 点を追加\n'
+        '• 点をドラッグ → 音量を調整\n'
+        '• 右クリック → 点を削除\n'
+        '• 黄色の線 → 音量の増減\n'
+        '• 緑の線 → 調整後の音量\n'
+        + _COMMON_HINTS
+    ),
+}
 
 
 class MainWindow(QMainWindow):
@@ -140,14 +164,14 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._redo_act)
 
         edit_menu.addSeparator()
-        reset_act = QAction('エンベロープをリセット', self)
+        reset_act = QAction('音量の調整をリセット', self)
         reset_act.triggered.connect(self._reset_envelope)
         edit_menu.addAction(reset_act)
 
         view_menu = menu.addMenu('表示')
         for label, key, slot in [
-            ('拡大', 'Ctrl+=', lambda: self._waveform.zoom(2.0, self._player.position_sec)),
-            ('縮小', 'Ctrl+-', lambda: self._waveform.zoom(0.5, self._player.position_sec)),
+            ('拡大', 'Ctrl+=', lambda: self._zoom(2.0)),
+            ('縮小', 'Ctrl+-', lambda: self._zoom(0.5)),
             ('全体を表示', 'Ctrl+0', self._waveform_show_all),
         ]:
             act = QAction(label, self)
@@ -182,9 +206,16 @@ class MainWindow(QMainWindow):
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setStyleSheet('color:#444;')
 
-        self._mode_btn = QPushButton('✎ エンベロープ編集')
-        self._mode_btn.setCheckable(True)
-        self._mode_btn.toggled.connect(self._on_mode_toggled)
+        self._drag_btn = QPushButton('✋ ドラッグ編集')
+        self._drag_btn.setToolTip('波形をつまんで上下に動かします')
+        self._line_btn = QPushButton('✎ ライン編集')
+        self._line_btn.setToolTip('音量の線に点を打って動かします')
+        self._mode_group = QButtonGroup(self)
+        for btn, mode in [(self._drag_btn, MODE_DRAG), (self._line_btn, MODE_LINE)]:
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda _=False, m=mode: self._set_mode(m))
+            self._mode_group.addButton(btn)
+        self._drag_btn.setChecked(True)
 
         reset_btn = QPushButton('↩ リセット')
         reset_btn.clicked.connect(self._reset_envelope)
@@ -209,13 +240,28 @@ class MainWindow(QMainWindow):
         self._lower_spin.setDecimals(1)
         self._lower_spin.setFixedWidth(90)
 
-        for b in [open_btn, export_btn, self._mode_btn, reset_btn]:
+        zoom_btns = []
+        for label, tip, slot in [
+            ('－', '縮小（⌘-）', lambda: self._zoom(0.5)),
+            ('＋', '拡大（⌘=）', lambda: self._zoom(2.0)),
+            ('全体', '全体を表示（⌘0）', self._waveform_show_all),
+        ]:
+            btn = QPushButton(label)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            zoom_btns.append(btn)
+        self._zoom_out_btn, self._zoom_in_btn, self._show_all_btn = zoom_btns
+
+        for b in [open_btn, export_btn, self._drag_btn, self._line_btn, reset_btn, *zoom_btns]:
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # スペースキーを再生に使うため
 
-        for w in [open_btn, export_btn, sep, self._mode_btn, reset_btn, sep2,
+        for w in [open_btn, export_btn, sep, self._drag_btn, self._line_btn, reset_btn, sep2,
                   threshold_label_up, self._upper_spin, threshold_label_lo, self._lower_spin]:
             layout.addWidget(w)
         layout.addStretch()
+        layout.addWidget(QLabel('表示:'))
+        for b in zoom_btns:
+            layout.addWidget(b)
         self._toolbar = bar
         return bar
 
@@ -238,17 +284,9 @@ class MainWindow(QMainWindow):
         # Hint
         hint_group = QGroupBox('操作方法')
         hint_layout = QVBoxLayout(hint_group)
-        hint = QLabel(
-            '• 編集モードでクリック\n  → 制御点を追加\n'
-            '• 制御点をドラッグ\n  → 音量を調整\n'
-            '• 右クリック → 制御点削除\n'
-            '• 緑の線 → 調整後の音量\n'
-            '• 上端の赤 → 音割れの位置\n'
-            '• ⌘+スクロール → 拡大縮小\n'
-            '• スペース → 再生/一時停止'
-        )
-        hint.setStyleSheet('color:#666; font-size:11px; line-height:1.8;')
-        hint_layout.addWidget(hint)
+        self._hint = QLabel(HINTS[MODE_DRAG])
+        self._hint.setStyleSheet('color:#666; font-size:11px; line-height:1.8;')
+        hint_layout.addWidget(self._hint)
 
         layout.addWidget(info_group)
         layout.addWidget(hint_group)
@@ -444,10 +482,10 @@ class MainWindow(QMainWindow):
         self._undo_act.setEnabled(bool(self._undo_stack))
         self._redo_act.setEnabled(bool(self._redo_stack))
 
-    @pyqtSlot(bool)
-    def _on_mode_toggled(self, checked: bool):
-        self._waveform.set_envelope_mode(checked)
-        self._mode_btn.setText('👁 表示のみ' if checked else '✎ エンベロープ編集')
+    def _set_mode(self, mode: str) -> None:
+        self._waveform.set_mode(mode)
+        (self._drag_btn if mode == MODE_DRAG else self._line_btn).setChecked(True)
+        self._hint.setText(HINTS[mode])
 
     @pyqtSlot()
     def _reset_envelope(self):
@@ -467,6 +505,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # View
     # ------------------------------------------------------------------
+
+    def _zoom(self, factor: float) -> None:
+        # 再生位置が見えていればそこを中心に、見えていなければ画面の中央を中心にする
+        start, end = self._waveform._view_start, self._waveform._view_end
+        pos = self._player.position_sec
+        self._waveform.zoom(factor, pos if start <= pos <= end else None)
 
     def _waveform_show_all(self):
         if self._duration > 0:

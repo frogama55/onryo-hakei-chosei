@@ -1,6 +1,6 @@
 import numpy as np
 from PyQt6.QtWidgets import QWidget, QSizePolicy
-from PyQt6.QtCore import Qt, QPointF, pyqtSignal, QRectF
+from PyQt6.QtCore import Qt, QEvent, QPointF, pyqtSignal, QRectF
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QLinearGradient,
     QPainterPath, QFont, QPixmap,
@@ -17,11 +17,22 @@ GAIN_SNAP_DB = 0.5
 GAIN_TICKS = [24, 12, 6, 0, -6, -12, -24, -40, -60]
 TIME_STEPS = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600]
 
+MODE_DRAG = 'drag'   # 波形そのものをつまんで上下に動かす
+MODE_LINE = 'line'   # 音量の線に点を打って動かす
+DRAG_START_PX = 3    # 縦にこれだけ動かすまではクリック（再生位置の移動）として扱う
+ANCHOR_PX = 60       # ドラッグ編集で、つまんだ位置の左右に置く固定の点までの距離
+
 
 def format_time(sec: float) -> str:
     m, s = divmod(int(sec), 60)
     h, m = divmod(m, 60)
     return f'{h}:{m:02d}:{s:02d}' if h else f'{m}:{s:02d}'
+
+
+def snap_gain(gain: float) -> float:
+    if abs(gain) < GAIN_SNAP_DB:
+        return 0.0
+    return round(float(np.clip(gain, GAIN_MIN_DB, GAIN_MAX_DB)), 1)
 
 
 class WaveformWidget(QWidget):
@@ -50,14 +61,20 @@ class WaveformWidget(QWidget):
 
         # 再生中は毎秒20回描き直すので、重い部分は作り置く
         self._background: QPixmap | None = None
-        self._applied: tuple[QPainterPath, list[float]] | None = None
+        self._applied: tuple[np.ndarray, QPainterPath, list[float]] | None = None
 
         # Interaction state
-        self._envelope_mode: bool = False
+        self._mode: str = MODE_DRAG
         self._dragging_idx: int = -1
         self._hover_idx: int = -1
+        # ドラッグ編集の1回の操作
+        self._press_pos: QPointF | None = None
+        self._press_gain: float = 0.0
+        self._before_press: list[tuple[float, float]] = []
+        self._drag_moved: bool = False
 
         self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
 
     # ------------------------------------------------------------------
     # Public API
@@ -71,6 +88,7 @@ class WaveformWidget(QWidget):
         self._duration = duration
         self._envelope = envelope
         self._playhead = 0.0
+        self._end_press()
         self.show_all()
 
     def refresh_envelope(self) -> None:
@@ -90,12 +108,16 @@ class WaveformWidget(QWidget):
         self._lower_threshold = lower
         self._invalidate()
 
-    def set_envelope_mode(self, enabled: bool) -> None:
-        self._envelope_mode = enabled
-        self._dragging_idx = -1
+    def mode(self) -> str:
+        return self._mode
+
+    def set_mode(self, mode: str) -> None:
+        self._mode = mode
+        self._end_press()
         self._hover_idx = -1
-        self.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
-        self.update()
+        self.setCursor(Qt.CursorShape.SizeVerCursor if mode == MODE_DRAG
+                       else Qt.CursorShape.CrossCursor)
+        self._invalidate()  # 波形の描き方がモードで変わる
 
     def set_view(self, start: float, span: float) -> None:
         span = float(np.clip(span, min(MIN_VIEW_SEC, self._duration), self._duration))
@@ -121,7 +143,7 @@ class WaveformWidget(QWidget):
     # Coordinate helpers
     # ------------------------------------------------------------------
 
-    def _db_to_y(self, db: float) -> float:
+    def _db_to_y(self, db):
         frac = (DB_MAX - db) / (DB_MAX - DB_MIN)
         return frac * self.height()
 
@@ -131,10 +153,7 @@ class WaveformWidget(QWidget):
 
     def _y_to_gain(self, y: float) -> float:
         frac = y / self.height()
-        gain = GAIN_MAX_DB - frac * (GAIN_MAX_DB - GAIN_MIN_DB)
-        if abs(gain) < GAIN_SNAP_DB:
-            return 0.0
-        return round(float(np.clip(gain, GAIN_MIN_DB, GAIN_MAX_DB)), 1)
+        return snap_gain(GAIN_MAX_DB - frac * (GAIN_MAX_DB - GAIN_MIN_DB))
 
     def _time_to_x(self, t: float) -> float:
         span = self._view_end - self._view_start
@@ -165,6 +184,25 @@ class WaveformWidget(QWidget):
         self._applied = None
         self.update()
 
+    def _adjusted(self) -> tuple[np.ndarray, QPainterPath, list[float]]:
+        """調整後の音量（画面の列ごとの y）、その線、音割れする列を求める。"""
+        if self._applied is None:
+            W = self.width()
+            centers, rms, peak = self._columns(W)
+            gain = self._envelope.gain_db_array(centers)
+            ys = self._db_to_y(np.clip(rms + gain, DB_MIN, DB_MAX))
+            self._applied = (ys, self._polyline(ys),
+                             [float(x) for x in np.nonzero(peak + gain > 0.0)[0]])
+        return self._applied
+
+    def _point_pos(self, t: float, gain: float) -> QPointF:
+        """点を描く位置。ドラッグ編集では調整後の波形の上、ライン編集では音量の線の上。"""
+        x = self._time_to_x(t)
+        if self._mode == MODE_LINE:
+            return QPointF(x, self._gain_to_y(gain))
+        ys = self._adjusted()[0]
+        return QPointF(x, float(ys[int(np.clip(x, 0, len(ys) - 1))]))
+
     # ------------------------------------------------------------------
     # Paint
     # ------------------------------------------------------------------
@@ -177,11 +215,15 @@ class WaveformWidget(QWidget):
         painter = QPainter(self)
         painter.drawPixmap(0, 0, self._background)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if self._rms_db is not None and self._envelope is not None:
-            if not self._envelope.is_flat():
-                self._draw_applied(painter, W, H)
-            if self._envelope_mode:
-                self._draw_envelope(painter, W, H)
+        if self._rms_db is not None and self._envelope is not None and self._view_end > self._view_start:
+            if self._mode == MODE_DRAG:
+                self._draw_adjusted_waveform(painter, W, H)
+            else:
+                if not self._envelope.is_flat():
+                    self._draw_applied(painter, W, H)
+                self._draw_gain_scale(painter, W, H)
+                self._draw_envelope_line(painter)
+            self._draw_points(painter, W)
         self._draw_playhead(painter, W, H)
 
     def _build_background(self, W: int, H: int) -> QPixmap:
@@ -194,7 +236,10 @@ class WaveformWidget(QWidget):
         self._draw_grid(p, W, H)
         self._draw_threshold_zones(p, W, H)
         if self._rms_db is not None and self._view_end > self._view_start:
-            self._draw_waveform(p, W, H)
+            if self._mode == MODE_DRAG:
+                self._draw_original_outline(p, W)
+            else:
+                self._draw_waveform(p, W, H)
             self._draw_time_axis(p, W, H)
         self._draw_threshold_lines(p, W, H)
         p.end()
@@ -236,15 +281,16 @@ class WaveformWidget(QWidget):
         # Below lower: blue
         p.fillRect(QRectF(0, y_lower, W, H - y_lower), QColor(52, 152, 219, 20))
 
-    def _draw_waveform(self, p: QPainter, W: int, H: int):
-        _, rms, _ = self._columns(W)
-        ys = [self._db_to_y(float(db)) for db in rms]
-
-        outline = QPainterPath()
-        outline.moveTo(0.0, ys[0])
+    @staticmethod
+    def _polyline(ys) -> QPainterPath:
+        path = QPainterPath()
+        path.moveTo(0.0, float(ys[0]))
         for x, y in enumerate(ys):
-            outline.lineTo(float(x), y)
+            path.lineTo(float(x), float(y))
+        return path
 
+    @staticmethod
+    def _fill_waveform(p: QPainter, outline: QPainterPath, W: int, H: int):
         fill = QPainterPath(outline)
         fill.lineTo(float(W), float(H))
         fill.lineTo(0.0, float(H))
@@ -261,28 +307,34 @@ class WaveformWidget(QWidget):
         p.setPen(pen)
         p.drawPath(outline)
 
-    def _build_applied(self, W: int) -> tuple[QPainterPath, list[float]]:
-        """調整後の音量の線と、音割れする位置を求める。"""
-        centers, rms, peak = self._columns(W)
-        gain = self._envelope.gain_db_array(centers)
-        ys = self._db_to_y(np.minimum(rms + gain, DB_MAX))
+    def _draw_waveform(self, p: QPainter, W: int, H: int):
+        _, rms, _ = self._columns(W)
+        self._fill_waveform(p, self._polyline(self._db_to_y(rms)), W, H)
 
-        path = QPainterPath()
-        path.moveTo(0.0, float(ys[0]))
-        for x, y in enumerate(ys):
-            path.lineTo(float(x), float(y))
-        return path, [float(x) for x in np.nonzero(peak + gain > 0.0)[0]]
+    def _draw_original_outline(self, p: QPainter, W: int):
+        """ドラッグ編集で、調整前の波形を薄い線で残す。"""
+        _, rms, _ = self._columns(W)
+        pen = QPen(QColor(200, 200, 200, 90))
+        pen.setWidthF(1.0)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.drawPath(self._polyline(self._db_to_y(rms)))
+
+    def _draw_adjusted_waveform(self, p: QPainter, W: int, H: int):
+        _, outline, clipped = self._adjusted()
+        self._fill_waveform(p, outline, W, H)
+        self._draw_clipping(p, clipped)
 
     def _draw_applied(self, p: QPainter, W: int, H: int):
-        if self._applied is None:
-            self._applied = self._build_applied(W)
-        path, clipped = self._applied
-
+        _, path, clipped = self._adjusted()
         pen = QPen(QColor(120, 230, 150, 220))
         pen.setWidthF(1.2)
         p.setPen(pen)
         p.drawPath(path)
+        self._draw_clipping(p, clipped)
 
+    @staticmethod
+    def _draw_clipping(p: QPainter, clipped: list[float]):
         # 音割れする位置は上端に赤で示す
         for x in clipped:
             p.fillRect(QRectF(x, 0, 1, 7), QColor('#ff3b30'))
@@ -305,7 +357,7 @@ class WaveformWidget(QWidget):
             p.setPen(QPen(QColor(color_hex)))
             p.drawText(QRectF(36, y - 16, 150, 14), Qt.AlignmentFlag.AlignLeft, label)
 
-    def _draw_envelope(self, p: QPainter, W: int, H: int):
+    def _draw_gain_scale(self, p: QPainter, W: int, H: int):
         # 増減なし（0 dB）の基準線とゲインの目盛り
         p.setFont(QFont('Helvetica', 9))
         for gain in GAIN_TICKS:
@@ -319,36 +371,34 @@ class WaveformWidget(QWidget):
         y0 = self._gain_to_y(0.0)
         p.drawLine(QPointF(0, y0), QPointF(W, y0))
 
-        pts = self._envelope.get_points()
-
-        # Line
+    def _draw_envelope_line(self, p: QPainter):
         path = QPainterPath()
-        for i, (t, gain) in enumerate(pts):
-            x = self._time_to_x(t)
-            y = self._gain_to_y(gain)
+        for i, (t, gain) in enumerate(self._envelope.get_points()):
+            pos = QPointF(self._time_to_x(t), self._gain_to_y(gain))
             if i == 0:
-                path.moveTo(x, y)
+                path.moveTo(pos)
             else:
-                path.lineTo(x, y)
+                path.lineTo(pos)
         pen = QPen(QColor(255, 220, 50, 220))
         pen.setWidthF(2.0)
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
 
-        # Control points
-        for i, (t, gain) in enumerate(pts):
-            x = self._time_to_x(t)
+    def _draw_points(self, p: QPainter, W: int):
+        p.setFont(QFont('Helvetica', 9))
+        for i, (t, gain) in enumerate(self._envelope.get_points()):
+            pos = self._point_pos(t, gain)
+            x, y = pos.x(), pos.y()
             if x < -HIT_RADIUS or x > W + HIT_RADIUS:
                 continue
-            y = self._gain_to_y(gain)
             is_hover = (i == self._hover_idx)
             is_drag = (i == self._dragging_idx)
 
             r = CTRL_POINT_RADIUS + (2 if (is_hover or is_drag) else 0)
             p.setBrush(QBrush(QColor(255, 215, 0) if not is_drag else QColor(255, 255, 100)))
             p.setPen(QPen(QColor('white'), 1.5))
-            p.drawEllipse(QPointF(x, y), r, r)
+            p.drawEllipse(pos, r, r)
 
             if is_hover or is_drag:
                 p.setPen(QColor('white'))
@@ -382,28 +432,37 @@ class WaveformWidget(QWidget):
         pos = event.position()
 
         if event.button() == Qt.MouseButton.RightButton:
-            if self._envelope_mode:
-                self._try_remove_point(pos)
+            self._try_remove_point(pos)
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
             return
 
-        if self._envelope_mode:
-            idx = self._find_point_at(pos)
-            if idx < 0:
-                # Add new control point
-                idx = self._envelope.add_point(self._x_to_time(pos.x()), self._y_to_gain(pos.y()))
-                self._applied = None
-            self._dragging_idx = idx
+        if self._mode == MODE_DRAG:
+            # 点はまだ作らない。縦に動かしたら作り、動かさずに離したら再生位置の移動にする
+            self._press_pos = pos
+            self._drag_moved = False
+            self._before_press = self._envelope.get_points()
+            self._dragging_idx = self._find_point_at(pos)
+            if self._dragging_idx >= 0:
+                self._press_gain = self._before_press[self._dragging_idx][1]
             self.update()
-        else:
-            # Seek on click when not in envelope mode
-            self.seek_requested.emit(self._x_to_time(pos.x()))
+            return
+
+        idx = self._find_point_at(pos)
+        if idx < 0:
+            idx = self._envelope.add_point(self._x_to_time(pos.x()), self._y_to_gain(pos.y()))
+            self._applied = None
+        self._dragging_idx = idx
+        self.update()
 
     def mouseMoveEvent(self, event):
-        if not self._envelope_mode or self._envelope is None:
+        if self._envelope is None:
             return
         pos = event.position()
 
-        if self._dragging_idx >= 0:
+        if self._press_pos is not None:
+            self._drag_waveform(pos)
+        elif self._mode == MODE_LINE and self._dragging_idx >= 0:
             self._envelope.move_point(self._dragging_idx, self._x_to_time(pos.x()),
                                       self._y_to_gain(pos.y()))
             self.refresh_envelope()
@@ -411,17 +470,58 @@ class WaveformWidget(QWidget):
             new_hover = self._find_point_at(pos)
             if new_hover != self._hover_idx:
                 self._hover_idx = new_hover
-                self.setCursor(
-                    Qt.CursorShape.SizeAllCursor if new_hover >= 0
-                    else Qt.CursorShape.CrossCursor
-                )
+                if self._mode == MODE_LINE:
+                    self.setCursor(Qt.CursorShape.SizeAllCursor if new_hover >= 0
+                                   else Qt.CursorShape.CrossCursor)
                 self.update()
 
     def mouseReleaseEvent(self, event):
-        if self._dragging_idx >= 0:
+        if self._press_pos is not None:
+            if not self._drag_moved:
+                self.seek_requested.emit(self._x_to_time(self._press_pos.x()))
+            elif self._envelope.get_points()[self._dragging_idx][1] == self._press_gain:
+                # 動かして元の高さへ戻した: 作った点も残さない
+                self._envelope.set_points(self._before_press)
+                self.refresh_envelope()
+            else:
+                self.envelope_committed.emit()
+            self._end_press()
+            self.update()
+        elif self._dragging_idx >= 0:
             self._dragging_idx = -1
             self.envelope_committed.emit()
             self.update()
+
+    def _drag_waveform(self, pos: QPointF) -> None:
+        """ドラッグ編集: つまんだ所の波形がマウスに付いてくるようにゲインを変える。"""
+        dy = self._press_pos.y() - pos.y()
+        if not self._drag_moved:
+            if abs(dy) < DRAG_START_PX:
+                return
+            self._drag_moved = True
+            if self._dragging_idx < 0:
+                self._dragging_idx = self._add_grab_point(self._x_to_time(self._press_pos.x()))
+        db_per_px = (DB_MAX - DB_MIN) / self.height()
+        t = self._envelope.get_points()[self._dragging_idx][0]
+        self._envelope.move_point(self._dragging_idx, t, snap_gain(self._press_gain + dy * db_per_px))
+        self.refresh_envelope()
+
+    def _add_grab_point(self, t: float) -> int:
+        """つまんだ位置に点を置く。離れた所の音量が変わらないよう、左右にも点を置く。"""
+        span = self._view_end - self._view_start
+        w = ANCHOR_PX / self.width() * span
+        times = [p[0] for p in self._envelope.get_points()]
+        for anchor, lo, hi in [(t - w, t - w, t), (t + w, t, t + w)]:
+            inside = any(lo < pt < hi for pt in times)
+            if 0.0 < anchor < self._duration and not inside:
+                self._envelope.add_point(anchor, self._envelope.gain_db_at(anchor))
+        self._press_gain = self._envelope.gain_db_at(t)
+        return self._envelope.add_point(t, self._press_gain)
+
+    def _end_press(self) -> None:
+        self._press_pos = None
+        self._drag_moved = False
+        self._dragging_idx = -1
 
     def wheelEvent(self, event):
         if self._duration <= 0:
@@ -434,16 +534,24 @@ class WaveformWidget(QWidget):
             amount = delta.x() if abs(delta.x()) > abs(delta.y()) else delta.y()
             self.set_view(self._view_start - amount / 1200 * span, span)
 
+    def event(self, event):
+        # トラックパッドのピンチで拡大縮小
+        if (event.type() == QEvent.Type.NativeGesture
+                and event.gestureType() == Qt.NativeGestureType.ZoomNativeGesture):
+            self.zoom(max(0.1, 1.0 + event.value()), self._x_to_time(event.position().x()))
+            return True
+        return super().event(event)
+
     def _find_point_at(self, pos: QPointF) -> int:
-        if self._envelope is None:
+        if self._envelope is None or self._view_end <= self._view_start:
             return -1
+        best, best_dist = -1, HIT_RADIUS
         for i, (t, gain) in enumerate(self._envelope.get_points()):
-            x = self._time_to_x(t)
-            y = self._gain_to_y(gain)
-            dist = ((pos.x() - x) ** 2 + (pos.y() - y) ** 2) ** 0.5
-            if dist <= HIT_RADIUS:
-                return i
-        return -1
+            pt = self._point_pos(t, gain)
+            dist = ((pos.x() - pt.x()) ** 2 + (pos.y() - pt.y()) ** 2) ** 0.5
+            if dist <= best_dist:
+                best, best_dist = i, dist
+        return best
 
     def _try_remove_point(self, pos: QPointF) -> None:
         idx = self._find_point_at(pos)

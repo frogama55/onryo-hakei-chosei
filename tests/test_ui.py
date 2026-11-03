@@ -10,13 +10,14 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import numpy as np
 import soundfile as sf
 from PyQt6.QtCore import QEventLoop, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
-from PyQt6.QtGui import QDropEvent, QWheelEvent
+from PyQt6.QtGui import QDropEvent, QNativeGestureEvent, QPointingDevice, QWheelEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from app_info import APP_NAME
 from audio.loader import ensure_tools, load_file
-from ui.main_window import MainWindow
+from ui.main_window import HINTS, MainWindow
+from ui.waveform_widget import DB_MAX, DB_MIN, MODE_DRAG, MODE_LINE
 from utils import edit_store
 
 ensure_tools()
@@ -61,7 +62,8 @@ class WindowTest(unittest.TestCase):
         return QPoint(int(self.wave._time_to_x(t)), int(self.wave._gain_to_y(gain)))
 
     def edit_mode(self):
-        self.win._mode_btn.setChecked(True)
+        QTest.mouseClick(self.win._line_btn, LEFT)
+        self.assertEqual(self.wave.mode(), MODE_LINE)
 
     def add_point(self, t, gain):
         QTest.mouseClick(self.wave, LEFT, pos=self.point(t, gain))
@@ -98,7 +100,7 @@ class WindowTest(unittest.TestCase):
         self.assertEqual(len(self.env()), 3)
         self.assertAlmostEqual(self.env()[1][1], 12.0, delta=0.6)
 
-    def test_click_outside_edit_mode_seeks(self):
+    def test_click_in_drag_mode_seeks(self):
         QTest.mouseClick(self.wave, LEFT, pos=self.point(5.0, 0.0))
         self.assertAlmostEqual(self.win._player.position_sec, 5.0, delta=0.1)
         self.assertEqual(len(self.env()), 2)
@@ -144,6 +146,123 @@ class WindowTest(unittest.TestCase):
         self.assertTrue(wait_until(lambda: other._worker is None))
         self.assertEqual(other._envelope.get_points(), points)
         self.assertIn('復元', other._status.currentMessage())
+
+    # ------------------------------------------------------------------
+    # ドラッグ編集
+    # ------------------------------------------------------------------
+
+    def db_px(self, db):
+        return round(db / (DB_MAX - DB_MIN) * self.wave.height())
+
+    def on_wave(self, t):
+        """調整後の波形の上の位置。"""
+        pos = self.wave._point_pos(t, 0.0)
+        return QPoint(int(pos.x()), int(pos.y()))
+
+    def test_drag_mode_is_ready_after_load(self):
+        self.assertEqual(self.wave.mode(), MODE_DRAG)
+        self.assertTrue(self.win._drag_btn.isChecked())
+        self.assertEqual(self.win._hint.text(), HINTS[MODE_DRAG])
+
+    def test_drag_waveform_up_raises_that_part(self):
+        start = self.on_wave(5.0)
+        end = start - QPoint(0, self.db_px(6.0))
+        self.drag(start, end)
+        env = self.win._envelope
+        self.assertAlmostEqual(env.gain_db_at(5.0), 6.0, delta=0.3)
+        # 離れた所は変わらない
+        self.assertEqual(env.gain_db_at(1.0), 0.0)
+        self.assertEqual(env.gain_db_at(9.0), 0.0)
+        self.assertEqual(len(self.env()), 5)  # 両端、つまんだ点、左右の固定点
+        # 点は波形の上にあり、マウスに付いてきている
+        idx = [t for t, _ in self.env()].index(min((t for t, _ in self.env()), key=lambda t: abs(t - 5.0)))
+        pos = self.wave._point_pos(*self.env()[idx])
+        self.assertAlmostEqual(pos.y(), end.y(), delta=2)
+
+    def test_drag_waveform_is_one_undo_step(self):
+        start = self.on_wave(5.0)
+        self.drag(start, start + QPoint(0, self.db_px(10.0)))
+        self.assertAlmostEqual(self.win._envelope.gain_db_at(5.0), -10.0, delta=0.3)
+        self.win._undo()
+        self.assertEqual(len(self.env()), 2)
+        self.assertTrue(self.win._envelope.is_flat())
+
+    def test_drag_existing_point_again(self):
+        start = self.on_wave(5.0)
+        self.drag(start, start - QPoint(0, self.db_px(6.0)))
+        count = len(self.env())
+        again = self.on_wave(5.0)
+        self.drag(again, again - QPoint(0, self.db_px(4.0)))
+        self.assertEqual(len(self.env()), count)
+        self.assertAlmostEqual(self.win._envelope.gain_db_at(5.0), 10.0, delta=0.4)
+
+    def test_drag_back_to_start_leaves_nothing(self):
+        start = self.on_wave(5.0)
+        QTest.mousePress(self.wave, LEFT, pos=start)
+        QTest.mouseMove(self.wave, start - QPoint(0, 40))
+        QTest.mouseMove(self.wave, start)
+        QTest.mouseRelease(self.wave, LEFT, pos=start)
+        self.assertEqual(len(self.env()), 2)
+        self.assertFalse(self.win._undo_act.isEnabled())
+
+    def test_small_wobble_is_a_click(self):
+        start = self.on_wave(5.0)
+        self.drag(start, start + QPoint(8, 1))
+        self.assertEqual(len(self.env()), 2)
+        self.assertAlmostEqual(self.win._player.position_sec, 5.0, delta=0.1)
+
+    def test_second_grab_nearby_does_not_pin_inside_bump(self):
+        start = self.on_wave(5.0)
+        self.drag(start, start - QPoint(0, self.db_px(6.0)))
+        count = len(self.env())
+        # 右の固定点との間をつまむ。間に点があるので、新しい固定点は置かない
+        t = 5.0 + self.wave._x_to_time(30) - self.wave._x_to_time(0)
+        nearby = self.on_wave(t)
+        self.drag(nearby, nearby - QPoint(0, self.db_px(3.0)))
+        self.assertEqual(len(self.env()), count + 1)
+
+    def test_right_click_removes_point_in_drag_mode(self):
+        start = self.on_wave(5.0)
+        self.drag(start, start - QPoint(0, self.db_px(6.0)))
+        count = len(self.env())
+        QTest.mouseClick(self.wave, RIGHT, pos=self.on_wave(5.0))
+        self.assertEqual(len(self.env()), count - 1)
+
+    def test_switching_mode_keeps_points(self):
+        start = self.on_wave(5.0)
+        self.drag(start, start - QPoint(0, self.db_px(6.0)))
+        points = self.env()
+        self.edit_mode()
+        self.assertEqual(self.env(), points)
+        self.assertEqual(self.win._hint.text(), HINTS[MODE_LINE])
+        self.assertFalse(self.win.grab().isNull())
+        QTest.mouseClick(self.win._drag_btn, LEFT)
+        self.assertEqual(self.wave.mode(), MODE_DRAG)
+
+    def test_drag_when_zoomed_uses_visible_time(self):
+        self.wave.set_view(6.0, 2.0)
+        start = self.on_wave(7.0)
+        self.drag(start, start - QPoint(0, self.db_px(6.0)))
+        env = self.win._envelope
+        self.assertAlmostEqual(env.gain_db_at(7.0), 6.0, delta=0.3)
+        self.assertEqual(env.gain_db_at(5.0), 0.0)
+
+    def test_zoom_buttons(self):
+        QTest.mouseClick(self.win._zoom_in_btn, LEFT)
+        self.assertAlmostEqual(self.wave._view_end - self.wave._view_start, 5.0)
+        QTest.mouseClick(self.win._zoom_out_btn, LEFT)
+        self.assertAlmostEqual(self.wave._view_end - self.wave._view_start, 10.0)
+        QTest.mouseClick(self.win._zoom_in_btn, LEFT)
+        QTest.mouseClick(self.win._show_all_btn, LEFT)
+        self.assertAlmostEqual(self.wave._view_end - self.wave._view_start, 10.0)
+
+    def test_pinch_zooms(self):
+        before = self.wave._x_to_time(250.0)
+        event = QNativeGestureEvent(Qt.NativeGestureType.ZoomNativeGesture, QPointingDevice.primaryPointingDevice(),
+                                    2, QPointF(250, 100), QPointF(250, 100), QPointF(250, 100), 0.5, QPointF(0, 0))
+        QApplication.sendEvent(self.wave, event)
+        self.assertAlmostEqual(self.wave._view_end - self.wave._view_start, 10.0 / 1.5, delta=0.01)
+        self.assertAlmostEqual(self.wave._x_to_time(250.0), before, delta=0.02)
 
     def test_zoom_keeps_time_under_cursor(self):
         before = self.wave._x_to_time(250.0)
