@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QSplitter, QFrame, QMessageBox,
     QStatusBar, QProgressBar, QScrollBar,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot
+from PyQt6.QtCore import Qt, QEvent, QTimer, pyqtSlot
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 
 from app_info import APP_NAME, COPYRIGHT_HOLDER, FFMPEG_NOTICE, SOURCE_URL, VERSION
@@ -185,7 +185,8 @@ class MainWindow(QMainWindow):
         about_act.triggered.connect(self._show_about)
         help_menu.addAction(about_act)
 
-        QShortcut(QKeySequence(Qt.Key.Key_Space), self, self._toggle_play)
+        space = QShortcut(QKeySequence(Qt.Key.Key_Space), self, self._toggle_play)
+        space.setAutoRepeat(False)  # 押し続けても再生と停止を繰り返さない
 
     def _build_toolbar(self) -> QWidget:
         bar = QWidget()
@@ -239,6 +240,8 @@ class MainWindow(QMainWindow):
         self._lower_spin.setSuffix(' dB')
         self._lower_spin.setDecimals(1)
         self._lower_spin.setFixedWidth(90)
+        for spin in [self._upper_spin, self._lower_spin]:
+            spin.installEventFilter(self)  # 入力欄にカーソルがあってもスペースで再生する
 
         zoom_btns = []
         for label, tip, slot in [
@@ -607,6 +610,13 @@ class MainWindow(QMainWindow):
             if url.isLocalFile():
                 self.load_path(url.toLocalFile())
                 break
+
+    def eventFilter(self, obj, event):
+        # 数値の入力欄はスペースを自分で使おうとするので、渡さずにショートカットへ回す
+        if (event.type() == QEvent.Type.ShortcutOverride and event.key() == Qt.Key.Key_Space
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier):
+            return True
+        return super().eventFilter(obj, event)
 
     def closeEvent(self, event):
         if self._worker is not None:

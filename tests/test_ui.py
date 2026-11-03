@@ -363,6 +363,14 @@ class WindowTest(unittest.TestCase):
             QTest.keyClick(self.win, Qt.Key.Key_Space)
         play.assert_called_once()
 
+    def test_space_key_plays_wherever_focus_is(self):
+        for widget in [self.win._upper_spin, self.win._lower_spin, self.wave]:
+            widget.setFocus()
+            with mock.patch.object(self.win._player, 'play') as play:
+                QTest.keyClick(widget, Qt.Key.Key_Space)
+            play.assert_called_once()
+        self.assertEqual(self.win._upper_spin.value(), -6.0)
+
     def test_close_is_refused_during_work(self):
         self.win.load_path(self.src)
         self.assertFalse(self.win.close())
