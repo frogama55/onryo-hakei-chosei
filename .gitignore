@@ -1,0 +1,19 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# ビルドの生成物
+*.app
+*.icns
+*.iconset/
+build/
+dist/
+third_party/
+.venv*/
+
+# 手元の作業用（公開しない）
+_backup_*/
+.claude/
+CLAUDE.md
+NOTES.md
+docs/
